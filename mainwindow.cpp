@@ -9,8 +9,11 @@
 #include <QDateTime>
 #include <QTextStream>
 #include <QSplitter>
+#include <QSplitter>
 #include <cmath>
 #include <QtMath>
+#include <QtCharts/QChart>
+#include <QtCharts/QBarCategoryAxis>
 
 // ========== 构造函数 & 界面搭建 ==========
 MainWindow::MainWindow(QWidget *parent)
@@ -18,6 +21,7 @@ MainWindow::MainWindow(QWidget *parent)
 {
     setupUI();
     setupChart();
+    setupHarmonicChart();
     setupStatusBar();
 }
 
@@ -26,7 +30,7 @@ void MainWindow::setupUI()
     auto *central = new QWidget(this);
     auto *mainLayout = new QVBoxLayout(central);
 
-    // 使用 QSplitter 分割输入/结果 + 波形图
+    // 主分割器: 上(输入+结果) / 中(波形图) / 下(谐波图)
     auto *splitter = new QSplitter(Qt::Vertical, this);
 
     // ---- 上半部分: 输入 + 结果 ----
@@ -56,6 +60,10 @@ void MainWindow::setupUI()
     spinFreq = new QDoubleSpinBox; spinFreq->setRange(45, 65); spinFreq->setValue(50.0);
     spinFreq->setSuffix(" Hz"); spinFreq->setDecimals(1);
 
+    // 负载类型选择
+    comboLoadType = new QComboBox;
+    comboLoadType->addItems({"线性负载", "整流负载(6脉波)", "变频驱动(PWM)", "电弧负载"});
+
     inputLayout->addRow("A相电压 Ua:", spinVa);
     inputLayout->addRow("B相电压 Ub:", spinVb);
     inputLayout->addRow("C相电压 Uc:", spinVc);
@@ -64,6 +72,7 @@ void MainWindow::setupUI()
     inputLayout->addRow("C相电流 Ic:", spinIc);
     inputLayout->addRow("功率因数 PF:", spinPF);
     inputLayout->addRow("电网频率:", spinFreq);
+    inputLayout->addRow("负载类型:", comboLoadType);
 
     // 计算结果区
     auto *resultGroup = new QGroupBox("计算结果", this);
@@ -76,6 +85,10 @@ void MainWindow::setupUI()
     labelS = new QLabel("0.00 VA");
     labelP = new QLabel("0.00 W");
     labelQ = new QLabel("0.00 var");
+    labelTHDv = new QLabel("0.00 %");
+    labelTHDi = new QLabel("0.00 %");
+    labelQuality = new QLabel("——");
+    labelQuality->setStyleSheet("font-weight:bold; color:#1a73e8;");
 
     resultLayout->addRow("平均电压:", labelVavg);
     resultLayout->addRow("平均电流:", labelIavg);
@@ -84,17 +97,26 @@ void MainWindow::setupUI()
     resultLayout->addRow("视在功率 S:", labelS);
     resultLayout->addRow("有功功率 P:", labelP);
     resultLayout->addRow("无功功率 Q:", labelQ);
+    resultLayout->addRow("电压THD:", labelTHDv);
+    resultLayout->addRow("电流THD:", labelTHDi);
+    resultLayout->addRow("电能质量:", labelQuality);
 
     topLayout->addWidget(inputGroup, 3);
     topLayout->addWidget(resultGroup, 2);
 
-    // ---- 下半部分: 波形图 ----
+    // ---- 中间: 波形图 ----
     chartView = new QChartView;
     chartView->setRenderHint(QPainter::Antialiasing);
-    chartView->setMinimumHeight(250);
+    chartView->setMinimumHeight(200);
+
+    // ---- 下半部分: 谐波柱状图 ----
+    harmonicChartView = new QChartView;
+    harmonicChartView->setRenderHint(QPainter::Antialiasing);
+    harmonicChartView->setMinimumHeight(200);
 
     splitter->addWidget(topWidget);
     splitter->addWidget(chartView);
+    splitter->addWidget(harmonicChartView);
 
     // ---- 按钮 ----
     auto *btnLayout = new QHBoxLayout;
@@ -110,14 +132,14 @@ void MainWindow::setupUI()
     // ---- 日志 ----
     textLog = new QTextEdit;
     textLog->setReadOnly(true);
-    textLog->setMaximumHeight(100);
+    textLog->setMaximumHeight(80);
 
     // ---- 历史记录表 ----
-    tableHistory = new QTableWidget(0, 10);
+    tableHistory = new QTableWidget(0, 12);
     tableHistory->setHorizontalHeaderLabels(
-        {"序号","Uavg","Iavg","Vunb%","Iunb%","S(VA)","P(W)","Q(var)","PF","时间"});
+        {"序号","Uavg","Iavg","Vunb%","Iunb%","S(VA)","P(W)","Q(var)","PF","THDv%","THDi%","时间"});
     tableHistory->horizontalHeader()->setStretchLastSection(true);
-    tableHistory->setMaximumHeight(150);
+    tableHistory->setMaximumHeight(120);
 
     // ---- 布局组装 ----
     mainLayout->addWidget(splitter);
@@ -135,20 +157,19 @@ void MainWindow::setupUI()
 
 void MainWindow::setupStatusBar()
 {
-    statusBar()->showMessage("就绪 — 版本 1.1 (含波形图)");
+    statusBar()->showMessage("就绪 — 版本 1.2 (含THD谐波分析与GB/T 14549评估)");
 }
 
+// ========== 电压/电流波形图 ==========
 void MainWindow::setupChart()
 {
     auto *chart = new QChart;
     chart->setTitle("三相电压/电流实时波形");
     chart->setAnimationOptions(QChart::SeriesAnimations);
 
-    // 三相电压曲线
     seriesVa = new QLineSeries; seriesVa->setName("Ua");
     seriesVb = new QLineSeries; seriesVb->setName("Ub");
     seriesVc = new QLineSeries; seriesVc->setName("Uc");
-    // 三相电流曲线 (虚线)
     seriesIa = new QLineSeries; seriesIa->setName("Ia");
     seriesIb = new QLineSeries; seriesIb->setName("Ib");
     seriesIc = new QLineSeries; seriesIc->setName("Ic");
@@ -158,7 +179,6 @@ void MainWindow::setupChart()
     chart->addSeries(seriesVa); chart->addSeries(seriesVb); chart->addSeries(seriesVc);
     chart->addSeries(seriesIa); chart->addSeries(seriesIb); chart->addSeries(seriesIc);
 
-    // 坐标轴
     axisX = new QValueAxis; axisX->setTitleText("角度 (°)"); axisX->setRange(0, 360);
     axisY_V = new QValueAxis; axisY_V->setTitleText("电压 (V)");
     axisY_I = new QValueAxis; axisY_I->setTitleText("电流 (A)");
@@ -180,7 +200,7 @@ void MainWindow::updateChart(const ThreePhaseParams &p)
     seriesVa->clear(); seriesVb->clear(); seriesVc->clear();
     seriesIa->clear(); seriesIb->clear(); seriesIc->clear();
 
-    double w = 2.0 * M_PI * p.freq; // 角频率
+    double w = 2.0 * M_PI * p.freq;
     double Vm_a = p.Va * std::sqrt(2.0);
     double Vm_b = p.Vb * std::sqrt(2.0);
     double Vm_c = p.Vc * std::sqrt(2.0);
@@ -188,7 +208,6 @@ void MainWindow::updateChart(const ThreePhaseParams &p)
     double Im_b = p.Ib * std::sqrt(2.0);
     double Im_c = p.Ic * std::sqrt(2.0);
 
-    // 相位偏移: A=0°, B=-120°, C=+120°
     for (int deg = 0; deg <= 360; deg += 2) {
         double rad = deg * M_PI / 180.0;
         seriesVa->append(deg, Vm_a * std::sin(rad));
@@ -199,25 +218,82 @@ void MainWindow::updateChart(const ThreePhaseParams &p)
         seriesIc->append(deg, Im_c * std::sin(rad + 2.0 * M_PI / 3.0));
     }
 
-    // 自动缩放 Y 轴
     double maxV = qMax({Vm_a, Vm_b, Vm_c}) * 1.2;
     double maxI = qMax({Im_a, Im_b, Im_c}) * 1.2;
     axisY_V->setRange(-maxV, maxV);
     axisY_I->setRange(-maxI, maxI);
 }
 
+// ========== 谐波柱状图 ==========
+void MainWindow::setupHarmonicChart()
+{
+    auto *chart = new QChart;
+    chart->setTitle("谐波频谱分析 (各次谐波含量)");
+    chart->setAnimationOptions(QChart::SeriesAnimations);
+
+    harmonicBarSeries = new QBarSeries;
+    chart->addSeries(harmonicBarSeries);
+
+    auto *axisX_har = new QBarCategoryAxis;
+    axisX_har->setTitleText("谐波次数");
+    chart->addAxis(axisX_har, Qt::AlignBottom);
+
+    auto *axisY_har = new QValueAxis;
+    axisY_har->setTitleText("含量 (%)");
+    axisY_har->setRange(0, 30);
+    chart->addAxis(axisY_har, Qt::AlignLeft);
+
+    harmonicBarSeries->attachAxis(axisX_har);
+    harmonicBarSeries->attachAxis(axisY_har);
+
+    harmonicChartView->setChart(chart);
+}
+
+void MainWindow::updateHarmonicChart(const HarmonicResult &hr)
+{
+    harmonicBarSeries->clear();
+
+    auto *vSet = new QBarSet("电压谐波");
+    auto *iSet = new QBarSet("电流谐波");
+    vSet->setColor(QColor("#4285F4"));
+    iSet->setColor(QColor("#EA4335"));
+
+    QStringList categories;
+
+    for (const auto &h : hr.vHarmonics) {
+        if (h.order > 1) {
+            categories << QString("%1次").arg(h.order);
+            *vSet << (h.magnitude / (hr.vHarmonics[0].magnitude > 0 ? hr.vHarmonics[0].magnitude : 1.0)) * 100.0;
+        }
+    }
+    for (const auto &h : hr.iHarmonics) {
+        if (h.order > 1) {
+            *iSet << (h.magnitude / (hr.iHarmonics[0].magnitude > 0 ? hr.iHarmonics[0].magnitude : 1.0)) * 100.0;
+        }
+    }
+
+    harmonicBarSeries->append(vSet);
+    harmonicBarSeries->append(iSet);
+
+    // 更新类别轴
+    auto *chart = harmonicChartView->chart();
+    auto axes = chart->axes(Qt::Horizontal);
+    if (!axes.isEmpty()) {
+        auto *axis = qobject_cast<QBarCategoryAxis*>(axes.first());
+        if (axis) axis->clear();
+        if (axis) axis->append(categories);
+    }
+}
+
 // ========== 自动推算功率因数 ==========
 double MainWindow::autoCalcPF(const ThreePhaseParams &p)
 {
-    // 假设典型感性负载: PF 与电压/电流不平衡度相关
     double vUnb = calcUnbalance(p.Va, p.Vb, p.Vc);
     double iUnb = calcUnbalance(p.Ia, p.Ib, p.Ic);
-    // 不平衡度越高 PF 越低; 基准 0.95, 每 10% 不平衡降 0.05
     double pf = 0.95 - ((vUnb + iUnb) / 20.0) * 0.1;
     return qBound(0.5, pf, 1.0);
 }
 
-// ========== 不平衡度计算 ==========
 double MainWindow::calcUnbalance(double a, double b, double c)
 {
     double avg = (a + b + c) / 3.0;
@@ -226,7 +302,6 @@ double MainWindow::calcUnbalance(double a, double b, double c)
     return (maxDev / avg) * 100.0;
 }
 
-// ========== 三相功率计算 ==========
 PowerResults MainWindow::calcThreePhasePower(const ThreePhaseParams &p)
 {
     PowerResults r;
@@ -234,11 +309,9 @@ PowerResults MainWindow::calcThreePhasePower(const ThreePhaseParams &p)
     r.Iavg = (p.Ia + p.Ib + p.Ic) / 3.0;
     r.Vunbalance = calcUnbalance(p.Va, p.Vb, p.Vc);
     r.Iunbalance = calcUnbalance(p.Ia, p.Ib, p.Ic);
-
     r.S = std::sqrt(3.0) * r.Vavg * r.Iavg;
     r.P = r.S * p.pf;
     r.Q = r.S * std::sqrt(1.0 - p.pf * p.pf);
-
     return r;
 }
 
@@ -254,13 +327,12 @@ void MainWindow::onCalculate()
     p.pf   = spinPF->value();
     p.freq = spinFreq->value();
 
-    // 自动推算功率因数并提示
     double autoPF = autoCalcPF(p);
     textLog->append(QString("[推算] 自动推算功率因数: %1").arg(autoPF, 0, 'f', 2));
 
     PowerResults r = calcThreePhasePower(p);
 
-    // 更新显示
+    // 更新基本显示
     labelVavg->setText(QString::number(r.Vavg, 'f', 2) + " V");
     labelIavg->setText(QString::number(r.Iavg, 'f', 2) + " A");
     labelVunb->setText(QString::number(r.Vunbalance, 'f', 2) + " %");
@@ -269,15 +341,34 @@ void MainWindow::onCalculate()
     labelP->setText(QString::number(r.P, 'f', 2) + " W");
     labelQ->setText(QString::number(r.Q, 'f', 2) + " var");
 
-    // 更新波形图
+    // 谐波分析
+    int loadType = comboLoadType->currentIndex();
+    HarmonicResult hr = analyzer.analyze(r.Vavg, r.Iavg, loadType, p.freq);
+    labelTHDv->setText(QString::number(hr.thd_v, 'f', 2) + " %");
+    labelTHDi->setText(QString::number(hr.thd_i, 'f', 2) + " %");
+    labelQuality->setText(hr.quality);
+
+    // 质量颜色
+    if (hr.quality.startsWith("优"))
+        labelQuality->setStyleSheet("font-weight:bold; color:#0F9D58;");
+    else if (hr.quality.startsWith("良"))
+        labelQuality->setStyleSheet("font-weight:bold; color:#4285F4;");
+    else if (hr.quality.startsWith("合格"))
+        labelQuality->setStyleSheet("font-weight:bold; color:#F4B400;");
+    else
+        labelQuality->setStyleSheet("font-weight:bold; color:#EA4335;");
+
+    // 更新两个图
     updateChart(p);
+    updateHarmonicChart(hr);
 
     // 日志
-    QString log = QString("[%1] Uavg=%2V Iavg=%3A Vunb=%4% S=%5VA P=%6W Q=%7var")
+    QString log = QString("[%1] Uavg=%2V Iavg=%3A S=%4VA P=%5W THDv=%6% THDi=%7% [%8]")
         .arg(QDateTime::currentDateTime().toString("hh:mm:ss"))
         .arg(r.Vavg, 0, 'f', 1).arg(r.Iavg, 0, 'f', 1)
-        .arg(r.Vunbalance, 0, 'f', 1).arg(r.S, 0, 'f', 1)
-        .arg(r.P, 0, 'f', 1).arg(r.Q, 0, 'f', 1);
+        .arg(r.S, 0, 'f', 1).arg(r.P, 0, 'f', 1)
+        .arg(hr.thd_v, 0, 'f', 1).arg(hr.thd_i, 0, 'f', 1)
+        .arg(hr.quality);
     textLog->append(log);
 
     // 历史记录
@@ -292,9 +383,11 @@ void MainWindow::onCalculate()
     tableHistory->setItem(row, 6, new QTableWidgetItem(QString::number(r.P, 'f', 1)));
     tableHistory->setItem(row, 7, new QTableWidgetItem(QString::number(r.Q, 'f', 1)));
     tableHistory->setItem(row, 8, new QTableWidgetItem(QString::number(p.pf, 'f', 2)));
-    tableHistory->setItem(row, 9, new QTableWidgetItem(QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss")));
+    tableHistory->setItem(row, 9, new QTableWidgetItem(QString::number(hr.thd_v, 'f', 1)));
+    tableHistory->setItem(row, 10, new QTableWidgetItem(QString::number(hr.thd_i, 'f', 1)));
+    tableHistory->setItem(row, 11, new QTableWidgetItem(QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss")));
 
-    statusBar()->showMessage(QString("计算完成 — 第 %1 条记录").arg(recordCount));
+    statusBar()->showMessage(QString("计算完成 — 第 %1 条记录 | %2").arg(recordCount).arg(hr.quality));
 }
 
 void MainWindow::onClear()
@@ -306,12 +399,16 @@ void MainWindow::onClear()
     labelS->setText("0.00 VA");
     labelP->setText("0.00 W");
     labelQ->setText("0.00 var");
+    labelTHDv->setText("0.00 %");
+    labelTHDi->setText("0.00 %");
+    labelQuality->setText("——");
+    labelQuality->setStyleSheet("font-weight:bold; color:#1a73e8;");
     textLog->clear();
     tableHistory->setRowCount(0);
     recordCount = 0;
-    // 清空波形图
     seriesVa->clear(); seriesVb->clear(); seriesVc->clear();
     seriesIa->clear(); seriesIb->clear(); seriesIc->clear();
+    harmonicBarSeries->clear();
     statusBar()->showMessage("已清空所有记录");
 }
 
@@ -332,7 +429,7 @@ void MainWindow::onExport()
     }
     QTextStream out(&file);
     out << "\xEF\xBB\xBF";
-    out << "序号,Uavg(V),Iavg(A),Vunb(%),Iunb(%),S(VA),P(W),Q(var),PF,时间\n";
+    out << "序号,Uavg(V),Iavg(A),Vunb(%),Iunb(%),S(VA),P(W),Q(var),PF,THDv(%),THDi(%),时间\n";
     for (int i = 0; i < tableHistory->rowCount(); ++i) {
         for (int j = 0; j < tableHistory->columnCount(); ++j) {
             if (j > 0) out << ",";
